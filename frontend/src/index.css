@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-gray-50 text-gray-900 antialiased;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-gray-100;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400;
+}
+
+/* Markdown content styling */
+.markdown-content h1 { @apply text-2xl font-bold mb-3; }
+.markdown-content h2 { @apply text-xl font-semibold mb-2; }
+.markdown-content h3 { @apply text-lg font-medium mb-2; }
+.markdown-content p { @apply mb-2 leading-relaxed; }
+.markdown-content ul { @apply list-disc pl-5 mb-2; }
+.markdown-content ol { @apply list-decimal pl-5 mb-2; }
+.markdown-content table { @apply w-full border-collapse mb-3; }
+.markdown-content th { @apply border border-gray-300 bg-gray-100 px-3 py-1.5 text-left font-medium; }
+.markdown-content td { @apply border border-gray-300 px-3 py-1.5; }
+.markdown-content blockquote { @apply border-l-4 border-primary-400 pl-4 italic text-gray-600 my-2; }
+.markdown-content code { @apply bg-gray-100 px-1 py-0.5 rounded text-sm font-mono; }
+
+/* Chat styling */
+.chat-bubble-user {
+  @apply bg-primary-600 text-white rounded-2xl rounded-br-md px-4 py-3;
+}
+.chat-bubble-assistant {
+  @apply bg-white border border-gray-200 rounded-2xl rounded-bl-md px-4 py-3 shadow-sm;
+}
