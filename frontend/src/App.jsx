@@ -18,6 +18,7 @@ import FAQPage from './pages/FAQPage';
 import TTSReader from './pages/TTSReader';
 import StudyMode from './pages/StudyMode';
 import AdminPanel from './pages/AdminPanel';
+import StudyPlanner from './pages/StudyPlanner';
 import Navbar from './components/Navbar';
 
 /** Protected route wrapper - redirects to login if not authenticated */
@@ -54,6 +55,7 @@ function AppRoutes() {
           <Route path="/faqs" element={<ProtectedRoute><FAQPage /></ProtectedRoute>} />
           <Route path="/reader" element={<ProtectedRoute><TTSReader /></ProtectedRoute>} />
           <Route path="/study" element={<ProtectedRoute><StudyMode /></ProtectedRoute>} />
+          <Route path="/planner" element={<ProtectedRoute><StudyPlanner /></ProtectedRoute>} />
           <Route path="/admin" element={<ProtectedRoute><AdminPanel /></ProtectedRoute>} />
           <Route path="/" element={<Navigate to={user ? '/dashboard' : '/login'} />} />
         </Routes>

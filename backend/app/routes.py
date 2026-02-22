@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
-from app.database import get_db, User, Document, DocumentStatus, DocumentChunk, UserRole, Bookmark, DocumentTag, ChatSession, ChatMessage, FAQ, ReadingProgress, UserPreference, Feedback
+from app.database import get_db, User, Document, DocumentStatus, DocumentChunk, UserRole, Bookmark, DocumentTag, ChatSession, ChatMessage, FAQ, ReadingProgress, UserPreference, Feedback, StudyTask
 from app.auth import (
     UserCreate, UserLogin, UserResponse, TokenResponse,
     register_user, login_user, get_current_user, require_role,
@@ -130,6 +130,23 @@ class DocumentResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class StudyTaskCreate(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    document_id: Optional[int] = None
+    due_date: Optional[str] = None  # ISO format string
+    priority: Optional[str] = "medium"  # low, medium, high
+
+
+class StudyTaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    document_id: Optional[int] = None
+    due_date: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None  # todo, in_progress, done
 
 
 # ══════════════════════════════════════════════
@@ -986,7 +1003,11 @@ def generate_faqs(
         if not chunks:
             continue
 
-        text = " ".join(c.content for c in chunks)
+        # Clean raw chunk text to remove PDF/slide artifacts before FAQ generation
+        chunk_texts = [c.content for c in chunks]
+        text = _clean_faq_text(chunk_texts)
+        if not text or len(text.split()) < 20:
+            continue
         faqs = generate_faqs_from_text(text, num_questions=request.num_questions)
 
         page_nums = sorted(set(c.page_number for c in chunks if c.page_number))
@@ -1237,43 +1258,251 @@ class FlashcardRequest(BaseModel):
 
 
 def _clean_ocr_text(text: str) -> str:
-    """
-    Fix common OCR artifacts:
-    - Single letters separated by spaces: "D a t a" → "Data"
-    - Removes lines that are predominantly single-character tokens (header garbage)
-    """
+    """Fix OCR artifacts: spaced characters, noise lines."""
     import re
-
-    # Fix spaced-out characters: sequences of (single-letter SPACE)+ ending in single-letter
-    # e.g. "D a t a S t r u c t u r e s" → "DataStructures"
     def _rejoin(m):
         return m.group().replace(" ", "")
-
     text = re.sub(r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b', _rejoin, text)
-
-    # Remove lines with >50% single-char words (OCR noise lines such as page headers/footers)
     clean_lines = []
     for line in text.splitlines():
         words = line.split()
         if not words:
             continue
-        single_char_ratio = sum(1 for w in words if len(w) == 1) / len(words)
-        if single_char_ratio > 0.5:
+        if sum(1 for w in words if len(w) == 1) / len(words) > 0.5:
             continue
         clean_lines.append(line)
-
     return " ".join(clean_lines)
 
 
-def _is_quality_chunk(text: str) -> bool:
-    """Return True if a chunk looks like real readable prose (not OCR garbage)."""
+def _is_quality_text(text: str, min_words: int = 8) -> bool:
+    """True if text looks like real prose (not OCR garbage or metadata)."""
     words = text.split()
-    if len(words) < 8:
+    if len(words) < min_words:
         return False
     avg_len = sum(len(w) for w in words) / len(words)
-    single_char_ratio = sum(1 for w in words if len(w) == 1) / len(words)
-    # Good text: avg word length ≥ 4 and very few isolated single letters
-    return avg_len >= 4.0 and single_char_ratio < 0.20
+    single_ratio = sum(1 for w in words if len(w) == 1) / len(words)
+    return avg_len >= 3.5 and single_ratio < 0.25
+
+
+def _clean_faq_text(chunks_text: list) -> str:
+    """
+    Clean raw PDF/PowerPoint chunk text for FAQ generation.
+    Removes table markers, pipe-separated table cells, slide numbers,
+    divider lines, OCR artifacts, metadata, and other PDF export noise.
+    """
+    import re
+
+    # Per-chunk quality filtering first
+    good_chunks = []
+    for chunk in chunks_text:
+        c = _clean_ocr_text(chunk)
+        if _is_quality_text(c, min_words=6):
+            good_chunks.append(c)
+
+    combined = " ".join(good_chunks)
+
+    # Remove [TABLE] / [/TABLE] markers
+    combined = re.sub(r'\[/?TABLE\]', ' ', combined, flags=re.IGNORECASE)
+    # Remove pipe-heavy table rows (2+ pipes)
+    combined = re.sub(r'[^\n]*(?:\|[^\n]*){2,}', ' ', combined)
+    # Remove isolated pipe characters
+    combined = re.sub(r'\s*\|\s*', ' ', combined)
+    # Remove slide / page counters like "5/23"
+    combined = re.sub(r'\b\d{1,3}\s*/\s*\d{2,3}\b', ' ', combined)
+    # Remove markdown/PPT divider lines
+    combined = re.sub(r'[-=_]{3,}', ' ', combined)
+    # Remove course codes like "BE 2106", "CS 101", etc.
+    combined = re.sub(r'\b[A-Z]{2,4}\s*\d{3,5}\b', ' ', combined)
+    # Remove credit patterns like "(3-0-0)", "(L-T-P)"
+    combined = re.sub(r'\(\d-\d-\d\)', ' ', combined)
+
+    # Sentence-level filtering
+    sentences = re.split(r'(?<=[.!?])\s+', combined)
+    clean_sentences = []
+    seen_starts: set = set()
+
+    # Metadata patterns to skip entirely
+    _META_PATTERNS = [
+        r'^(?:lecture\s+notes?|prepared\s+by|department\s+of|college\s+of|university)',
+        r'^(?:module|unit|chapter|syllabus|references?|bibliography|acknowledgement)',
+        r'^(?:prof\b|dr\.?\s|mr\.?\s|mrs\.?\s|ms\.?\s)',
+        r'^(?:page\s+\d|slide\s+\d|figure\s+\d|table\s+\d)',
+        r'^(?:introduction\s+to\s+data|data\s+structures?\s+using)',
+        r'(?:all\s+rights?\s+reserved|copyright|ISBN)',
+    ]
+
+    for s in sentences:
+        s = s.strip()
+        words = s.split()
+        # Minimum meaningful sentence (at least 8 words for FAQ-worthy content)
+        if len(words) < 8:
+            continue
+        # Skip near-duplicate starts (repeated slide titles)
+        key = s[:40].lower()
+        if key in seen_starts:
+            continue
+        # Skip ALL CAPS sentences (headers/titles)
+        alpha = re.sub(r'[^a-zA-Z]', '', s)
+        if alpha and sum(1 for c in alpha if c.isupper()) / len(alpha) > 0.7:
+            continue
+        # Skip metadata sentences
+        if any(re.search(p, s, re.IGNORECASE) for p in _META_PATTERNS):
+            continue
+        seen_starts.add(key)
+        clean_sentences.append(s)
+
+    result = " ".join(clean_sentences)
+    result = re.sub(r' {2,}', ' ', result).strip()
+    return result[:6000]
+
+
+def _extract_key_topics(material: str) -> list[dict]:
+    """
+    Extract study-worthy topic entries from the document text.
+    Each entry: {'question': str, 'context': str (relevant passage for AI answer)}
+    """
+    import re
+
+    _STOP = {
+        'the','a','an','is','are','was','were','be','been','being','have','has',
+        'had','it','its','this','that','these','those','in','on','at','of','for',
+        'to','and','or','by','with','from','but','not','can','will','which','so',
+        'as','also','such','may','would','could','should','each','than','into',
+        'about','between','after','before','through','during','our','we','their',
+        'they','then','there','here','when','where','if','how','what','more','most',
+        'some','any','all','other','only','very','just','even','still','much',
+    }
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', material) if len(s.strip()) > 35]
+    quality = [s for s in sentences if _is_quality_text(s, min_words=6)]
+    if not quality:
+        quality = sentences
+
+    topics: list[dict] = []
+    used_keys: set = set()
+
+    def _add(question: str, ctx_indices: list[int]):
+        key = question.lower().strip("?. ")[:50]
+        if key in used_keys or len(question) < 12:
+            return
+        used_keys.add(key)
+        passage = " ".join(quality[i] for i in ctx_indices if i < len(quality))
+        if len(passage) > 30:
+            topics.append({"question": question, "context": passage})
+
+    def _nearby(idx: int, window: int = 2) -> list[int]:
+        """Return indices [idx-1, idx, idx+1] clamped to the array bounds."""
+        return [i for i in range(max(0, idx - 1), min(len(quality), idx + window + 1))]
+
+    def _keyterms(text: str, n: int = 4) -> str:
+        """Extract n meaningful keywords from text, capitalizing first word."""
+        words = [w for w in text.split() if w.lower() not in _STOP and len(w) > 2
+                 and not w.startswith('(') and not w.endswith(')')]
+        if not words:
+            return "this concept"
+        # Capitalize first word, keep rest as-is
+        result = words[:n]
+        result[0] = result[0].capitalize()
+        return " ".join(result)
+
+    # ── Pattern 1: Definitions ──
+    for i, s in enumerate(quality):
+        for pat in [
+            r'^(.{3,60}?)\s+(?:is|are)\s+(?:a|an|the|one of)\s+(.{15,})',
+            r'^(.{3,60}?)\s+(?:refers? to|is defined as|means|is known as|is called)\s+(.{15,})',
+        ]:
+            m = re.match(pat, s, re.IGNORECASE)
+            if m:
+                term = re.sub(r'^(the|a|an)\s+', '', m.group(1).strip(), flags=re.IGNORECASE)
+                if 2 <= len(term.split()) <= 6 and len(term) > 3:
+                    _add(f"What is {term}?", _nearby(i))
+                break
+
+    # ── Pattern 2: Properties / Components ──
+    for i, s in enumerate(quality):
+        for pat in [
+            r'^(.{3,50}?)\s+(?:has|have|contains?|consists? of|includes?)\s+(.{15,})',
+            r'^(.{3,50}?)\s+(?:supports?|provides?|allows?|enables?|requires?)\s+(.{15,})',
+        ]:
+            m = re.match(pat, s, re.IGNORECASE)
+            if m:
+                subj = re.sub(r'^(the|a|an)\s+', '', m.group(1).strip(), flags=re.IGNORECASE)
+                if len(subj.split()) <= 5 and len(subj) > 3:
+                    _add(f"What are the key features of {subj}?", _nearby(i))
+                break
+
+    # ── Pattern 3: Complexity / Performance ──
+    for i, s in enumerate(quality):
+        if re.search(r'O\([^\)]+\)', s) or re.search(r'\b(worst|average|best)\s+case\b', s, re.I):
+            # Try to find the subject being discussed
+            m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|has|have|takes?|requires?)\b)', s, re.I)
+            subj = m_subj.group(1).strip() if m_subj else _keyterms(s, 3)
+            _add(f"What is the time/space complexity of {subj}?", _nearby(i))
+
+    # ── Pattern 4: Comparisons ──
+    for i, s in enumerate(quality):
+        lower = s.lower()
+        if any(kw in lower for kw in [' compared to ', ' unlike ', ' versus ', ' difference between ', ' similar to ', ' in contrast ']):
+            m_subj = re.search(r'(?:compared to|unlike|versus|difference between|similar to)\s+(.{3,40}?)(?:\.|,|$)', s, re.I)
+            if m_subj:
+                subj = m_subj.group(1).strip().rstrip('.')
+                _add(f"How do these compare: {_keyterms(s[:60], 3)} vs {subj}?", _nearby(i))
+            else:
+                _add(f"Compare: {_keyterms(s, 4)}", _nearby(i))
+
+    # ── Pattern 5: Advantages / Disadvantages ──
+    for i, s in enumerate(quality):
+        lower = s.lower()
+        # Find the subject of the sentence
+        m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:has|have|is|are|offers?)\b)', s, re.I)
+        subj = m_subj.group(1).strip() if m_subj else _keyterms(s, 3)
+        if re.search(r'\b(advantage|benefit|strength|efficient)\b', lower):
+            _add(f"What are the advantages of {subj}?", _nearby(i))
+        elif re.search(r'\b(disadvantage|drawback|limitation|slow|overhead|expensive)\b', lower):
+            _add(f"What are the limitations of {subj}?", _nearby(i))
+
+    # ── Pattern 6: "Used for / Used in / Application" ──
+    for i, s in enumerate(quality):
+        lower = s.lower()
+        if re.search(r'\b(used (for|in|to|when)|application|commonly|typically)\b', lower):
+            m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|can be)\s+used\b)', s, re.I)
+            if not m_subj:
+                m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are)\b)', s, re.I)
+            subj = m_subj.group(1).strip() if m_subj else _keyterms(s, 3)
+            _add(f"What are the applications of {subj}?", _nearby(i))
+
+    # ── Pattern 7: Process / Steps / Algorithm ──
+    for i, s in enumerate(quality):
+        lower = s.lower()
+        if re.search(r'\b(step|first|then|next|finally|process|procedure|algorithm)\b', lower):
+            m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|works|involves|begins|starts|requires)\b)', s, re.I)
+            subj = m_subj.group(1).strip() if m_subj else _keyterms(s, 4)
+            _add(f"Describe the process of {subj}", _nearby(i, window=3))
+
+    # ── Pattern 8: Cause / Reason ──
+    for i, s in enumerate(quality):
+        lower = s.lower()
+        if any(kw in lower for kw in ['because ', 'in order to ', 'so that ', 'reason ', 'important because']):
+            m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|was|exists?|works?)\b)', s, re.I)
+            subj = m_subj.group(1).strip() if m_subj else _keyterms(s, 4)
+            _add(f"Why is {subj} important?", _nearby(i))
+
+    # ── Pattern 9: Fill remaining slots with quality concept cards (no duplicates) ──
+    for i, s in enumerate(quality):
+        if len(topics) >= 25:
+            break
+        # Try to get a proper subject from the sentence
+        m_subj = re.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|was|were|has|have|can|will|provides?)\b)', s, re.I)
+        if m_subj:
+            subj = m_subj.group(1).strip()
+            if len(subj) > 3 and len(subj.split()) <= 5:
+                _add(f"Explain: {subj}", _nearby(i))
+        else:
+            words = [w for w in s.split() if w.lower() not in _STOP and len(w) > 2]
+            if len(words) >= 5:
+                _add(f"Explain the concept: {' '.join(words[:4])}", _nearby(i))
+
+    return topics
 
 
 @documents_router.post("/flashcards/generate")
@@ -1282,7 +1511,7 @@ def generate_flashcards(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Generate AI-powered flashcards from a document for study mode."""
+    """Generate AI-powered flashcards from a document using BART or Ollama."""
     doc = db.query(Document).filter(
         Document.id == request.document_id,
         Document.owner_id == current_user.id,
@@ -1297,118 +1526,94 @@ def generate_flashcards(
     if not chunks:
         return {"flashcards": [], "message": "No content available"}
 
-    # ── 1. Clean OCR artifacts from every chunk, keep only high-quality ones ──
-    cleaned_chunks = []
-    for c in chunks:
-        cleaned = _clean_ocr_text(c.content)
-        if _is_quality_chunk(cleaned):
-            cleaned_chunks.append(cleaned)
+    # ── 1. Clean and assemble document material ──
+    cleaned = [_clean_ocr_text(c.content) for c in chunks]
+    quality_chunks = [c for c in cleaned if _is_quality_text(c)]
+    if not quality_chunks:
+        quality_chunks = cleaned
 
-    # If nothing passes quality filter fall back to just cleaning all chunks
-    if not cleaned_chunks:
-        cleaned_chunks = [_clean_ocr_text(c.content) for c in chunks]
+    # Spread across whole document, take up to 8000 chars
+    step = max(1, len(quality_chunks) // 12)
+    material = " ".join(quality_chunks[::step])[:8000].strip()
 
-    # Take up to 5000 chars from the best chunks (spread across document)
-    step = max(1, len(cleaned_chunks) // 8)
-    sampled = cleaned_chunks[::step]
-    material = " ".join(sampled)[:5000].strip()
-
-    if not material:
+    if not material or len(material) < 50:
         return {"flashcards": [], "message": "Could not extract readable content"}
 
-    # ── 2. Ask Ollama to generate specific, AI-explained flashcards ──
+    # ── 2. Try Ollama first (full LLM — best quality) ──
+    from app.ai import query_ollama, summarize_text
+    import json, re as _re_fc
+
+    ollama_cards = []
     prompt = (
         f"You are a university professor creating study flashcards.\n\n"
-        f"TASK: Generate exactly {request.num_cards} high-quality flashcards from the study material below.\n\n"
-        f"STRICT RULES:\n"
-        f"1. 'front': A specific, meaningful question or term (NOT a document title or filename)\n"
-        f"2. 'back': A clear, complete explanation written in your own words — expand on the concept for student clarity\n"
-        f"3. Focus on: definitions, algorithms, data structure properties, time/space complexity, use cases, comparisons\n"
-        f"4. Questions must be self-contained (readable without the source document)\n"
-        f"5. Answers should be 2-4 sentences — informative, not just a one-liner\n"
-        f"6. NEVER use titles, author names, or book metadata as flashcard content\n"
-        f"7. Cover a variety of topics from across the material\n\n"
-        f"STUDY MATERIAL:\n---\n{material}\n---\n\n"
-        f"Respond ONLY with a valid JSON array of {request.num_cards} objects:\n"
-        f'[{{"front": "question here", "back": "AI-explained answer here"}}, ...]'
+        f"Generate exactly {request.num_cards} study flashcards from the material below.\n\n"
+        f"RULES:\n"
+        f"1. 'front': A specific question about a concept, definition, algorithm, or property\n"
+        f"2. 'back': A clear 2-4 sentence explanation that a student can learn from\n"
+        f"3. NEVER use book titles, author names, or file names as content\n"
+        f"4. Questions must be self-contained and meaningful\n"
+        f"5. Cover diverse topics from across the material\n\n"
+        f"MATERIAL:\n---\n{material[:5000]}\n---\n\n"
+        f"Respond ONLY with a valid JSON array:\n"
+        f'[{{"front": "question", "back": "detailed answer"}}, ...]'
     )
 
-    from app.ai import query_ollama
     result = query_ollama(
         prompt,
-        system_prompt=(
-            "You are an expert educator. Generate precise, student-friendly flashcards. "
-            "Each answer should be a clear, self-contained explanation — not a raw excerpt. "
-            "Respond ONLY in valid JSON array format."
-        ),
+        system_prompt="You are an expert educator. Create clear, study-worthy flashcards. Respond ONLY in valid JSON.",
         max_tokens=3000,
     )
 
-    flashcards = []
     if result:
         try:
-            import json, re as _re_fc
-            # Try to extract JSON array from the response
-            json_match = _re_fc.search(r'\[.*?\]', result, _re_fc.DOTALL)
-            if not json_match:
-                json_match = _re_fc.search(r'\[.*\]', result, _re_fc.DOTALL)
-            if json_match:
-                cards = json.loads(json_match.group())
+            jm = _re_fc.search(r'\[.*\]', result, _re_fc.DOTALL)
+            if jm:
+                cards = json.loads(jm.group())
                 for card in cards:
-                    front = card.get("front", "").strip()
-                    back = card.get("back", "").strip()
-                    # Skip cards with garbage: too short, spaced chars, or just titles
-                    if (
-                        front and back
-                        and len(front) > 10
-                        and len(back) > 20
-                        and _is_quality_chunk(back + " " + back)  # back must look like real prose
-                    ):
-                        flashcards.append({"front": front, "back": back})
+                    f = card.get("front", "").strip()
+                    b = card.get("back", "").strip()
+                    if f and b and len(f) > 10 and len(b) > 25:
+                        ollama_cards.append({"front": f, "back": b})
         except Exception:
             pass
 
-    # ── 3. Improved sentence-based fallback (only for quality sentences) ──
-    if not flashcards:
-        import re as _re_fc2
-        # Split on sentence boundaries
-        all_sentences = _re_fc2.split(r'(?<=[.!?])\s+', material)
-        # Keep only real, clean sentences
-        good_sentences = [
-            s.strip() for s in all_sentences
-            if len(s.strip()) > 50
-            and _is_quality_chunk(s)
-        ]
+    if len(ollama_cards) >= request.num_cards:
+        return {
+            "document_id": request.document_id,
+            "filename": doc.original_name,
+            "flashcards": ollama_cards[:request.num_cards],
+            "total": len(ollama_cards[:request.num_cards]),
+        }
 
-        for sent in good_sentences:
-            if len(flashcards) >= request.num_cards:
-                break
-            words = sent.split()
-            lower = sent.lower()
+    # ── 3. BART-enhanced fallback: extract topics then AI-polish answers ──
+    topics = _extract_key_topics(material)
 
-            # Pattern: "X is/are/refers to Y" → What is X?
-            for marker in [' is ', ' are ', ' refers to ', ' means ', ' defined as ']:
-                if marker in lower:
-                    idx = lower.index(marker)
-                    term = sent[:idx].strip()
-                    explanation = sent[idx + len(marker):].strip()
-                    if len(term) > 4 and len(explanation) > 15 and len(term.split()) <= 6:
-                        flashcards.append({
-                            "front": f"What is {term}?",
-                            "back": f"{term}{marker}{explanation}",
-                        })
-                        break
-            else:
-                # Generic: turn a key statement into a question
-                if len(words) >= 8:
-                    # Build question from 4-5 meaningful words (skip common stopwords)
-                    stopwords = {'the', 'a', 'an', 'is', 'are', 'of', 'in', 'to', 'and', 'or'}
-                    key_words = [w for w in words[:10] if w.lower() not in stopwords][:5]
-                    if key_words:
-                        flashcards.append({
-                            "front": f"Explain the concept related to: {' '.join(key_words)}",
-                            "back": sent,
-                        })
+    flashcards = list(ollama_cards)  # keep any Ollama cards we got
+
+    for topic in topics:
+        if len(flashcards) >= request.num_cards:
+            break
+
+        question = topic["question"]
+        context = topic["context"]
+
+        # Use BART to generate a clear, condensed answer from the relevant passage
+        bart_prompt = f"Question: {question}\n\nContext: {context}"
+        try:
+            ai_answer = summarize_text(bart_prompt, max_length=200, min_length=40)
+        except Exception:
+            ai_answer = ""
+
+        # If BART produced a useful answer, use it; otherwise use the raw context
+        if ai_answer and len(ai_answer.strip()) > 30 and not ai_answer.startswith("["):
+            answer = ai_answer.strip()
+        else:
+            # Trim context to 2-3 sentences as fallback
+            ctx_sents = [s.strip() for s in _re_fc.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 20]
+            answer = " ".join(ctx_sents[:3])
+
+        if len(answer) > 30 and len(question) > 10:
+            flashcards.append({"front": question, "back": answer})
 
     return {
         "document_id": request.document_id,
@@ -1647,6 +1852,7 @@ def highlight_in_pdf(
             "score": r.final_score,
             "chunk_index": r.chunk_index if hasattr(r, 'chunk_index') else 0,
             "source_type": r.source_type,
+            "file": doc.original_name,
         })
 
     # Sort by page number
@@ -2099,4 +2305,190 @@ def document_stats_overview(
         "total_words": total_words,
         "estimated_reading_time_min": reading_time,
         "total_faqs": faq_count,
+    }
+
+
+# ══════════════════════════════════════════════
+# STUDY PLANNER
+# ══════════════════════════════════════════════
+
+planner_router = APIRouter()
+
+
+@planner_router.get("/tasks")
+def get_study_tasks(
+    status: Optional[str] = Query(None),
+    priority: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get all study tasks for the current user with optional filters."""
+    q = db.query(StudyTask).filter(StudyTask.user_id == current_user.id)
+    if status:
+        q = q.filter(StudyTask.status == status)
+    if priority:
+        q = q.filter(StudyTask.priority == priority)
+    tasks = q.order_by(StudyTask.due_date.asc().nullslast(), StudyTask.created_at.desc()).all()
+
+    return [
+        {
+            "id": t.id,
+            "title": t.title,
+            "description": t.description or "",
+            "document_id": t.document_id,
+            "document_name": t.document.original_name if t.document else None,
+            "due_date": t.due_date.isoformat() if t.due_date else None,
+            "priority": t.priority,
+            "status": t.status,
+            "created_at": t.created_at.isoformat(),
+            "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+        }
+        for t in tasks
+    ]
+
+
+@planner_router.post("/tasks")
+def create_study_task(
+    request: StudyTaskCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new study task."""
+    due_date = None
+    if request.due_date:
+        try:
+            due_date = datetime.fromisoformat(request.due_date.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format.")
+
+    if request.document_id:
+        doc = db.query(Document).filter(
+            Document.id == request.document_id,
+            Document.owner_id == current_user.id,
+        ).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+    task = StudyTask(
+        user_id=current_user.id,
+        title=request.title,
+        description=request.description or "",
+        document_id=request.document_id,
+        due_date=due_date,
+        priority=request.priority or "medium",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "document_id": task.document_id,
+        "document_name": task.document.original_name if task.document else None,
+        "due_date": task.due_date.isoformat() if task.due_date else None,
+        "priority": task.priority,
+        "status": task.status,
+        "created_at": task.created_at.isoformat(),
+    }
+
+
+@planner_router.put("/tasks/{task_id}")
+def update_study_task(
+    task_id: int,
+    request: StudyTaskUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update a study task."""
+    task = db.query(StudyTask).filter(
+        StudyTask.id == task_id,
+        StudyTask.user_id == current_user.id,
+    ).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if request.title is not None:
+        task.title = request.title
+    if request.description is not None:
+        task.description = request.description
+    if request.document_id is not None:
+        task.document_id = request.document_id if request.document_id else None
+    if request.priority is not None:
+        if request.priority not in ("low", "medium", "high"):
+            raise HTTPException(status_code=400, detail="Priority must be low, medium, or high")
+        task.priority = request.priority
+    if request.status is not None:
+        if request.status not in ("todo", "in_progress", "done"):
+            raise HTTPException(status_code=400, detail="Status must be todo, in_progress, or done")
+        task.status = request.status
+    if request.due_date is not None:
+        try:
+            task.due_date = datetime.fromisoformat(request.due_date.replace("Z", "+00:00")) if request.due_date else None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+
+    task.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(task)
+
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "document_id": task.document_id,
+        "document_name": task.document.original_name if task.document else None,
+        "due_date": task.due_date.isoformat() if task.due_date else None,
+        "priority": task.priority,
+        "status": task.status,
+        "created_at": task.created_at.isoformat(),
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+
+
+@planner_router.delete("/tasks/{task_id}")
+def delete_study_task(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a study task."""
+    task = db.query(StudyTask).filter(
+        StudyTask.id == task_id,
+        StudyTask.user_id == current_user.id,
+    ).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    db.delete(task)
+    db.commit()
+    return {"message": "Task deleted", "id": task_id}
+
+
+@planner_router.get("/stats")
+def study_planner_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get study planner statistics."""
+    tasks = db.query(StudyTask).filter(StudyTask.user_id == current_user.id).all()
+    total = len(tasks)
+    todo = sum(1 for t in tasks if t.status == "todo")
+    in_progress = sum(1 for t in tasks if t.status == "in_progress")
+    done = sum(1 for t in tasks if t.status == "done")
+
+    overdue = 0
+    now = datetime.utcnow()
+    for t in tasks:
+        if t.due_date and t.due_date < now and t.status != "done":
+            overdue += 1
+
+    return {
+        "total": total,
+        "todo": todo,
+        "in_progress": in_progress,
+        "done": done,
+        "overdue": overdue,
+        "completion_rate": round(done / total * 100, 1) if total > 0 else 0,
     }

@@ -5,7 +5,7 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { FileText, Upload, MessageSquare, BarChart3, LogOut, History, Brain, HelpCircle, Headphones, GraduationCap, Shield } from 'lucide-react';
+import { FileText, Upload, MessageSquare, BarChart3, LogOut, History, Brain, HelpCircle, Headphones, GraduationCap, Shield, CalendarDays } from 'lucide-react';
 
 const navItems = [
   { path: '/dashboard', label: 'Dashboard', icon: BarChart3 },
@@ -17,6 +17,7 @@ const navItems = [
   { path: '/faqs', label: 'FAQs', icon: HelpCircle },
   { path: '/reader', label: 'Reader', icon: Headphones },
   { path: '/study', label: 'Study', icon: GraduationCap },
+  { path: '/planner', label: 'Planner', icon: CalendarDays },
 ];
 
 export default function Navbar() {

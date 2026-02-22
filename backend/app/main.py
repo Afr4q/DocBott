@@ -79,7 +79,7 @@ app.add_middleware(
 # ──────────────────────────────────────────────
 # Import and register routers
 # ──────────────────────────────────────────────
-from app.routes import auth_router, documents_router, chat_router, feedback_router, bookmarks_router, faq_router, progress_router, preferences_router, admin_router
+from app.routes import auth_router, documents_router, chat_router, feedback_router, bookmarks_router, faq_router, progress_router, preferences_router, admin_router, planner_router
 
 app.include_router(auth_router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(documents_router, prefix="/api/documents", tags=["Documents"])
@@ -90,6 +90,7 @@ app.include_router(faq_router, prefix="/api/faqs", tags=["FAQs"])
 app.include_router(progress_router, prefix="/api/progress", tags=["Reading Progress"])
 app.include_router(preferences_router, prefix="/api/preferences", tags=["Preferences"])
 app.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
+app.include_router(planner_router, prefix="/api/planner", tags=["Study Planner"])
 
 
 # ──────────────────────────────────────────────

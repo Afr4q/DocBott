@@ -284,7 +284,8 @@ export default function Chat() {
         document_id: selectedDocs[0],
         query: msg.query || msg.content,
       });
-      setHighlights((prev) => ({ ...prev, [msg.id]: res.data }));
+      const items = (res.data.highlights || []).map(h => ({ ...h, file: res.data.filename || 'Document' }));
+      setHighlights((prev) => ({ ...prev, [msg.id]: items }));
     } catch {
       toast.error('Highlighting failed');
       setShowHighlights((prev) => ({ ...prev, [msg.id]: false }));

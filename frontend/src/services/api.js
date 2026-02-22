@@ -163,4 +163,15 @@ export const adminAPI = {
   stats: () => api.get('/admin/stats'),
 };
 
+// ──────────────────────────────────────────────
+// Study Planner API
+// ──────────────────────────────────────────────
+export const plannerAPI = {
+  getTasks: (params) => api.get('/planner/tasks', { params }),
+  createTask: (data) => api.post('/planner/tasks', data),
+  updateTask: (id, data) => api.put(`/planner/tasks/${id}`, data),
+  deleteTask: (id) => api.delete(`/planner/tasks/${id}`),
+  stats: () => api.get('/planner/stats'),
+};
+
 export default api;

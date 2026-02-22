@@ -226,8 +226,13 @@ def query_rag(
         results = hybrid_search(query, document_ids=document_ids, top_k=top_k)
 
         if not results:
-            response.answer = "No relevant information found in the uploaded documents."
+            response.answer = (
+                "I couldn't find any relevant information about this in your uploaded documents. "
+                "This topic may not be covered in the current PDFs. Try rephrasing your question, "
+                "or switch to **AI mode** for general knowledge answers."
+            )
             response.reasoning = "No matching content retrieved from document store."
+            response.confidence = 0.0
             return response
 
         # Step 2: Optional re-ranking
@@ -237,6 +242,28 @@ def query_rag(
         # Enrich with filenames
         for r in results:
             r.filename = filenames.get(r.document_id, f"Document {r.document_id}")
+
+        # Check if results are too weak (out-of-context detection)
+        scores = [r.final_score for r in results]
+        max_score = max(scores)
+        avg_score = sum(scores) / len(scores)
+
+        if max_score < 0.15:
+            response.answer = (
+                "Your question doesn't appear to be covered in the uploaded documents. "
+                "The search found very low relevance matches. You can try:\n"
+                "- Rephrasing your question with keywords from the document\n"
+                "- Switching to **AI mode** for general knowledge answers\n"
+                "- Uploading additional documents that cover this topic"
+            )
+            response.confidence = max_score
+            response.reasoning = (
+                f"All {len(results)} retrieved segments had very low relevance "
+                f"(max score: {max_score:.4f}, avg: {avg_score:.4f}). "
+                "The question likely falls outside the scope of uploaded documents."
+            )
+            response.suggested_questions = generate_question_suggestions(results)
+            return response
 
         # Step 3: Generate extractive answer
         response.answer = generate_extractive_answer(query, results, role)

@@ -133,61 +133,101 @@ def summarize_for_comparison(
 # ──────────────────────────────────────────────
 # Direct AI Answer (no PDF grounding)
 # ──────────────────────────────────────────────
+def _extract_relevant_sentences(query: str, context: str, top_n: int = 8) -> str:
+    """
+    Extract the most query-relevant sentences from context using keyword overlap scoring.
+    Used as a smart pre-filter before passing text to BART.
+    """
+    import re
+    # Tokenise into sentences
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', context) if len(s.strip()) > 20]
+    if not sentences:
+        return context[:1024]
+
+    # Build a simple query keyword set (skip stopwords)
+    stopwords = {
+        'the','a','an','is','are','was','were','be','been','being','have','has',
+        'had','do','does','did','will','would','could','should','may','might',
+        'of','in','to','and','or','for','on','at','by','with','from','this',
+        'that','these','those','what','which','how','when','where','who','why'
+    }
+    query_words = {w.lower() for w in re.findall(r'\b\w+\b', query) if w.lower() not in stopwords and len(w) > 2}
+
+    # Score each sentence
+    def _score(sent: str) -> float:
+        words = {w.lower() for w in re.findall(r'\b\w+\b', sent)}
+        overlap = len(query_words & words)
+        # Boost sentences that contain key query terms early
+        return overlap + (0.5 if any(q in sent.lower() for q in query_words) else 0)
+
+    scored = sorted(enumerate(sentences), key=lambda x: _score(x[1]), reverse=True)
+    # Take top_n in original order for coherence
+    top_indices = sorted(i for i, _ in scored[:top_n])
+    return " ".join(sentences[i] for i in top_indices)
+
+
 def direct_ai_answer(query: str, context: str = "") -> str:
     """
     Generate a direct AI answer to a user question.
-    First tries Ollama (local LLM), then falls back to BART summarization.
-    This is NOT grounded in documents – it's a pure AI response.
-
-    Args:
-        query: The user's question.
-        context: Optional context from PDF retrieval to supplement the answer.
-
-    Returns:
-        AI-generated answer string.
+    1. Tries Ollama (LLaMA) first.
+    2. Falls back to BART with query-focused context selection.
+    3. Falls back to extractive answer from top-scored sentences.
     """
-    # Try Ollama first (better for Q&A)
+    # ── 1. Try Ollama ──────────────────────────────────────────
     if context:
         prompt = (
-            f"Answer the following question using the provided context.\n\n"
+            f"You are an expert assistant. Answer the question using ONLY the provided context.\n\n"
             f"Question: {query}\n\n"
-            f"Context: {context}\n\n"
-            f"Provide a clear, comprehensive answer:"
+            f"Context:\n{context[:2000]}\n\n"
+            f"Provide a thorough, well-structured answer in 3-5 sentences:"
         )
     else:
         prompt = (
-            f"Answer the following question clearly and comprehensively.\n\n"
-            f"Question: {query}\n\n"
-            f"Answer:"
+            f"Answer the following question clearly, accurately and in detail.\n\n"
+            f"Question: {query}\n\nAnswer:"
         )
 
     ollama_response = query_ollama(
         prompt=prompt,
         system_prompt=(
-            "You are a knowledgeable AI assistant. Provide clear, accurate, and "
-            "well-structured answers. If you are unsure about something, say so. "
-            "Use markdown formatting for readability."
+            "You are a knowledgeable AI assistant. Provide clear, accurate, "
+            "well-structured answers. Use markdown formatting when helpful."
         ),
         max_tokens=800,
     )
-
-    if ollama_response and len(ollama_response.strip()) > 20:
+    if ollama_response and len(ollama_response.strip()) > 30:
         return ollama_response.strip()
 
-    # Fallback: use BART summarization on the context if available
+    # ── 2. BART fallback: focus context on the query first ─────
     if context and len(context.strip()) > 50:
         try:
-            summary = summarize_text(context, max_length=300, min_length=80)
-            if summary:
-                return summary
+            # Select the most query-relevant sentences before feeding BART
+            focused = _extract_relevant_sentences(query, context, top_n=8)
+            bart_prompt = f"Question: {query}\n\nContext: {focused}"
+            summary = summarize_text(bart_prompt, max_length=250, min_length=60)
+            if summary and len(summary.strip()) > 30:
+                return summary.strip()
         except Exception as e:
-            logger.error(f"BART fallback failed: {e}")
+            logger.error(f"BART Q&A fallback failed: {e}")
 
-    # Final fallback: acknowledge limitations
+    # ── 3. Extractive fallback: return the top-scored sentences verbatim ──
+    if context and len(context.strip()) > 50:
+        try:
+            relevant = _extract_relevant_sentences(query, context, top_n=4)
+            if relevant and len(relevant.strip()) > 30:
+                return (
+                    f"Based on the document content:\n\n{relevant.strip()}\n\n"
+                    f"*(Note: For richer AI-generated explanations, start Ollama locally — "
+                    f"`ollama run llama3`)*"
+                )
+        except Exception:
+            pass
+
+    # ── 4. Final graceful fallback ─────────────────────────────
     return (
-        "I'm unable to generate a direct AI answer at this time. "
-        "This feature works best when an AI model like Ollama (LLaMA) is running locally. "
-        "You can still get answers grounded in your uploaded PDFs using the PDF answer mode."
+        "The AI answer mode works best when an Ollama model is running locally. "
+        "Switch to **PDF mode** to get answers grounded in your uploaded documents, "
+        "or start Ollama with: `ollama run llama3`"
     )
 
 
@@ -475,35 +515,65 @@ def fact_check_answer(answer: str, query: str, sources: list = None) -> dict:
 def generate_faqs_from_text(text: str, num_questions: int = 5) -> list:
     """
     Generate FAQ-style Q&A pairs from document text.
+    Uses Ollama (if available) or BART-powered topic extraction fallback.
     Returns list of dicts with 'question' and 'answer' keys.
     """
-    # Clean the text — remove excessive whitespace, short lines, page markers
-    lines = [l.strip() for l in text.split('\n') if len(l.strip()) > 15]
-    cleaned = '\n'.join(lines)[:4000]
+    # ── Internal PDF/slide noise cleaning ─────────────────────────────────────
+    text = _re_ai.sub(r'\[/?TABLE\]', ' ', text, flags=_re_ai.IGNORECASE)
+    text = _re_ai.sub(r'[^\n]*(?:\|[^\n]*){2,}', ' ', text)
+    text = _re_ai.sub(r'\s*\|\s*', ' ', text)
+    text = _re_ai.sub(r'\b\d{1,3}\s*/\s*\d{2,3}\b', ' ', text)
+    text = _re_ai.sub(r'[-=_]{3,}', ' ', text)
+    text = _re_ai.sub(r'\b[A-Z]{2,4}\s*\d{3,5}\b', ' ', text)
+    text = _re_ai.sub(r'\(\d-\d-\d\)', ' ', text)
+    text = _re_ai.sub(r' {2,}', ' ', text).strip()
 
-    if len(cleaned) < 50:
+    # Filter sentences — skip metadata/headers
+    _META_SKIP = [
+        r'^(?:lecture\s+notes?|prepared\s+by|department\s+of|college\s+of)',
+        r'^(?:module|unit|chapter|syllabus|references?|bibliography)',
+        r'^(?:prof\b|dr\.?\s|mr\.?\s)',
+        r'(?:all\s+rights?\s+reserved|copyright|ISBN)',
+    ]
+    raw_sents = [s.strip() for s in _re_ai.split(r'(?<=[.!?])\s+', text)]
+    sentences = []
+    seen_keys: set = set()
+    for s in raw_sents:
+        words = s.split()
+        if len(words) < 8:
+            continue
+        alpha = _re_ai.sub(r'[^a-zA-Z]', '', s)
+        if alpha and sum(1 for c in alpha if c.isupper()) / len(alpha) > 0.7:
+            continue
+        if any(_re_ai.search(p, s, _re_ai.IGNORECASE) for p in _META_SKIP):
+            continue
+        key = s[:50].lower()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        sentences.append(s)
+
+    cleaned = ' '.join(sentences)[:6000]
+    if len(cleaned) < 80:
         return []
 
+    # ── Try Ollama first ──────────────────────────────────────────────────────
     prompt = (
-        f"You are reading a document. Based ONLY on the content below, generate exactly {num_questions} "
-        f"frequently asked questions (FAQs) that someone studying this document would ask.\n\n"
+        f"Based ONLY on the text below, generate exactly {num_questions} "
+        f"study-oriented FAQ questions and answers.\n\n"
         f"RULES:\n"
-        f"- Each question MUST be answerable using ONLY the text below\n"
-        f"- Each answer MUST quote or closely paraphrase specific facts from the text\n"
-        f"- Do NOT invent information not present in the text\n"
-        f"- Do NOT ask meta questions like 'What is this document about?'\n"
-        f"- Ask specific, factual questions about key concepts, data, definitions, processes, or conclusions in the text\n"
-        f"- Keep answers concise (1-3 sentences)\n\n"
-        f"DOCUMENT TEXT:\n---\n{cleaned}\n---\n\n"
-        f"Respond ONLY with a JSON array of {num_questions} objects, each with \"question\" and \"answer\" fields."
+        f"- Ask about definitions, processes, comparisons, advantages, applications\n"
+        f"- Each answer should be detailed (2-4 sentences) using facts from the text\n"
+        f"- Do NOT ask about authors, page numbers, or document metadata\n"
+        f"- Questions should be specific and educational\n\n"
+        f"TEXT:\n{cleaned}\n\n"
+        f"Respond ONLY with a JSON array of objects with \"question\" and \"answer\" fields."
     )
-
     result = query_ollama(
         prompt,
-        system_prompt="You are a precise FAQ generator. You create Q&A pairs strictly from the provided document text. Never fabricate information. Respond ONLY in valid JSON array format.",
-        max_tokens=1500,
+        system_prompt="You are a study FAQ generator. Create specific, educational Q&A pairs from document text. Answers must be detailed and informative. JSON array output only.",
+        max_tokens=2000,
     )
-
     if result:
         try:
             import json
@@ -521,46 +591,223 @@ def generate_faqs_from_text(text: str, num_questions: int = 5) -> list:
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    # Fallback: extract key sentences and form Q&A from them
+    # ── Fallback: Smart topic extraction + BART answer generation ─────────────
+    _STOP_WORDS = {
+        'the','a','an','is','are','was','were','be','been','being','have','has',
+        'had','it','its','this','that','these','those','in','on','at','of','for',
+        'to','and','or','by','with','from','but','not','can','will','which','so',
+        'as','also','such','may','would','could','should','each','than','into',
+        'about','between','after','before','through','during','our','we','their',
+        'they','then','there','here','when','where','if','how','what','more','most',
+        'some','any','all','other','only','very','just','even','still','much',
+    }
+
+    # Pronouns / demonstratives that should never start a subject
+    _PRONOUN_STRIP = _re_ai.compile(
+        r'^(?:such|this|that|these|those|it|its|they|their|our|we|'
+        r'some|any|each|every|most|many|few|several|various|other)\s+',
+        _re_ai.IGNORECASE,
+    )
+
+    def _clean_subject(subj: str) -> str:
+        """Strip articles, pronouns, and leading junk from extracted subjects."""
+        subj = _re_ai.sub(r'^(the|a|an)\s+', '', subj.strip(), flags=_re_ai.IGNORECASE)
+        subj = _PRONOUN_STRIP.sub('', subj)
+        subj = subj.strip().rstrip('.,;:')
+        return subj
+
+    def _keyterms(txt: str, n: int = 4) -> str:
+        ws = [w for w in txt.split() if w.lower() not in _STOP_WORDS and len(w) > 2]
+        if not ws:
+            return "this concept"
+        ws[0] = ws[0].capitalize()
+        return " ".join(ws[:n])
+
+    def _get_rich_context(question: str, window_idx: int, window: int = 2) -> str:
+        """Get context by combining nearby text + keyword-relevant sentences."""
+        # Nearby sentences (local context)
+        start = max(0, window_idx - 1)
+        end = min(len(sentences), window_idx + window + 1)
+        nearby = " ".join(sentences[start:end])
+
+        # Also pull keyword-relevant sentences from the full text
+        relevant = _extract_relevant_sentences(question, cleaned, top_n=5)
+
+        # Combine, deduplicate, cap at ~1000 chars
+        combined = nearby + " " + relevant
+        # Simple dedup: split into sentences and remove duplicates
+        all_sents = _re_ai.split(r'(?<=[.!?])\s+', combined)
+        unique = []
+        seen = set()
+        for s in all_sents:
+            k = s[:40].lower()
+            if k not in seen and len(s.strip()) > 20:
+                seen.add(k)
+                unique.append(s.strip())
+        return " ".join(unique)[:1200]
+
     try:
-        sentences = [s.strip() for s in split_into_sentences(cleaned) if len(s.strip()) > 40]
-        if not sentences:
+        topics: list[dict] = []
+        used: set = set()
+
+        def _add(q: str, ctx_idx: int, window: int = 2):
+            key = q.lower()[:60]
+            if key in used or len(q) < 12:
+                return
+            # Validate question grammar — skip if it looks broken
+            if q.count(' is ') > 1:  # "What is X is done by?"
+                return
+            used.add(key)
+            context = _get_rich_context(q, ctx_idx, window)
+            topics.append({"question": q, "context": context})
+
+        # Pass 1: Definitions — "X is a/an/the ...", "X refers to ..."
+        for i, s in enumerate(sentences):
+            for pat in [
+                r'^(.{3,60}?)\s+(?:is|are)\s+(?:a|an|the|one of)\s+(.{15,})',
+                r'^(.{3,60}?)\s+(?:refers? to|is defined as|means|is known as|is called)\s+(.{15,})',
+            ]:
+                m = _re_ai.match(pat, s, _re_ai.IGNORECASE)
+                if m:
+                    term = _clean_subject(m.group(1))
+                    if 1 <= len(term.split()) <= 5 and len(term) > 2:
+                        _add(f"What is {term}?", i)
+                    break
+
+        # Pass 2: Properties / Features
+        for i, s in enumerate(sentences):
+            for pat in [
+                r'^(.{3,50}?)\s+(?:has|have|contains?|consists? of|includes?)\s+(.{15,})',
+                r'^(.{3,50}?)\s+(?:supports?|provides?|allows?|enables?)\s+(.{15,})',
+            ]:
+                m = _re_ai.match(pat, s, _re_ai.IGNORECASE)
+                if m:
+                    subj = _clean_subject(m.group(1))
+                    if len(subj.split()) <= 5 and len(subj) > 2:
+                        _add(f"What are the key features of {subj}?", i)
+                    break
+
+        # Pass 3: Complexity / Performance
+        for i, s in enumerate(sentences):
+            if _re_ai.search(r'O\([^\)]+\)', s) or _re_ai.search(r'\b(worst|average|best)\s+case\b', s, _re_ai.IGNORECASE):
+                m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|has|takes?)\b)', s, _re_ai.IGNORECASE)
+                subj = _clean_subject(m.group(1)) if m else _keyterms(s, 3)
+                _add(f"What is the time/space complexity of {subj}?", i)
+
+        # Pass 4: Comparisons
+        for i, s in enumerate(sentences):
+            lower = s.lower()
+            if any(kw in lower for kw in [' compared to ', ' unlike ', ' versus ', ' difference between ', ' similar to ']):
+                _add(f"How does {_keyterms(s, 3)} compare?", i)
+
+        # Pass 5: Advantages / Disadvantages
+        for i, s in enumerate(sentences):
+            lower = s.lower()
+            m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|has|have|offers?)\b)', s, _re_ai.IGNORECASE)
+            subj = _clean_subject(m.group(1)) if m else _keyterms(s, 3)
+            if _re_ai.search(r'\b(advantage|benefit|strength|efficient|faster)\b', lower):
+                _add(f"What are the advantages of {subj}?", i)
+            elif _re_ai.search(r'\b(disadvantage|drawback|limitation|slow|overhead)\b', lower):
+                _add(f"What are the limitations of {subj}?", i)
+
+        # Pass 6: Applications / Usage
+        for i, s in enumerate(sentences):
+            lower = s.lower()
+            if _re_ai.search(r'\b(used (for|in|to)|application|commonly|typically)\b', lower):
+                m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|can)\b)', s, _re_ai.IGNORECASE)
+                subj = _clean_subject(m.group(1)) if m else _keyterms(s, 3)
+                _add(f"What are the applications of {subj}?", i)
+
+        # Pass 7: Processes / Algorithms / Steps
+        for i, s in enumerate(sentences):
+            if _re_ai.search(r'\b(step|first|then|procedure|algorithm|process)\b', s, _re_ai.IGNORECASE):
+                m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|works|involves|begins)\b)', s, _re_ai.IGNORECASE)
+                subj = _clean_subject(m.group(1)) if m else _keyterms(s, 4)
+                _add(f"How does {subj} work?", i, window=3)
+
+        # Pass 8: Types / Categories
+        for i, s in enumerate(sentences):
+            if _re_ai.search(r'\b(types?\s+of|kinds?\s+of|categor|classified|classification)\b', s, _re_ai.IGNORECASE):
+                m = _re_ai.search(r'types?\s+of\s+(.{3,40}?)(?:\s*[:.,]|$)', s, _re_ai.IGNORECASE)
+                if m:
+                    _add(f"What are the types of {_clean_subject(m.group(1))}?", i)
+                else:
+                    _add(f"What are the types of {_keyterms(s, 3)}?", i)
+
+        # Pass 9: Examples / Illustrations
+        for i, s in enumerate(sentences):
+            lower = s.lower()
+            if _re_ai.search(r'\b(for example|for instance|e\.g\.|such as|like)\b', lower):
+                m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|has|include|can)\b)', s, _re_ai.IGNORECASE)
+                subj = _clean_subject(m.group(1)) if m else _keyterms(s, 3)
+                _add(f"What are examples of {subj}?", i)
+
+        # Pass 10: Purpose / Importance
+        for i, s in enumerate(sentences):
+            lower = s.lower()
+            if any(kw in lower for kw in ['because ', 'in order to ', 'so that ', 'important ', 'essential ', 'crucial ', 'necessary ']):
+                m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|was|exists?|works?)\b)', s, _re_ai.IGNORECASE)
+                subj = _clean_subject(m.group(1)) if m else _keyterms(s, 4)
+                _add(f"Why is {subj} important?", i)
+
+        # Pass 11: Fill remaining with concept explanations
+        for i, s in enumerate(sentences):
+            if len(topics) >= num_questions * 2:
+                break
+            m = _re_ai.match(r'^(?:The\s+)?(.{3,40}?)(?:\s+(?:is|are|was|were|has|have|can|provides?)\b)', s, _re_ai.IGNORECASE)
+            if m:
+                subj = _clean_subject(m.group(1))
+                if len(subj) > 3 and len(subj.split()) <= 5:
+                    _add(f"Explain {subj} in detail.", i, window=3)
+
+        if not topics:
             return []
 
+        # ── Generate detailed answers using BART for each topic ───────────────
         faqs = []
-        seen = set()
-        for sent in sentences:
+        for topic in topics[:num_questions * 2]:
             if len(faqs) >= num_questions:
                 break
-            # Skip duplicate-ish sentences
-            key = sent[:50].lower()
-            if key in seen:
-                continue
-            seen.add(key)
+            question = topic["question"]
+            context = topic["context"]
 
-            # Extract a meaningful subject from the sentence to form a question
-            words = sent.split()
-            if len(words) < 6:
-                continue
+            answer = None
 
-            # Find key noun phrases to ask about
-            # Look for patterns: "X is/are Y", "X refers to Y", "X means Y"
-            lower = sent.lower()
-            if ' is ' in lower or ' are ' in lower or ' was ' in lower or ' were ' in lower:
-                split_word = ' is ' if ' is ' in lower else ' are ' if ' are ' in lower else ' was ' if ' was ' in lower else ' were '
-                parts = sent.split(split_word, 1)
-                subject = parts[0].strip().rstrip(',').strip()
-                if 10 < len(subject) < 80:
-                    q = f"What is {subject}?"
-                    faqs.append({"question": q, "answer": sent})
-                    continue
+            # BART pass 1: focused Q&A summarization
+            try:
+                bart_prompt = f"Question: {question}\n\nContext: {context}"
+                polished = summarize_text(bart_prompt, max_length=150, min_length=40)
+                if (polished
+                    and len(polished.split()) >= 8
+                    and "Question:" not in polished
+                    and "Context:" not in polished
+                    and len(polished) > 40):
+                    answer = polished
+            except Exception:
+                pass
 
-            # Generic: "According to the document, [sentence]?"
-            if len(sent) > 40:
-                # Extract first meaningful phrase
-                subject = ' '.join(words[:6])
-                q = f"What does the document state about {subject.rstrip('.,;:')}?"
-                faqs.append({"question": q, "answer": sent})
+            # BART pass 2: try plain summarization of context if Q&A format failed
+            if not answer:
+                try:
+                    plain = summarize_text(context, max_length=120, min_length=30)
+                    if plain and len(plain.split()) >= 8 and len(plain) > 40:
+                        answer = plain
+                except Exception:
+                    pass
+
+            # Fallback: extract the best 2-3 sentences from context
+            if not answer:
+                ctx_sents = [s.strip() for s in _re_ai.split(r'(?<=[.!?])\s+', context)
+                             if len(s.strip()) > 25]
+                if len(ctx_sents) >= 2:
+                    answer = " ".join(ctx_sents[:3])
+                elif ctx_sents:
+                    answer = ctx_sents[0]
+                else:
+                    answer = context[:300]
+
+            if answer and len(answer) > 20:
+                faqs.append({"question": question, "answer": answer})
 
         return faqs
     except Exception:

@@ -247,3 +247,22 @@ class Annotation(Base):
 
     document = relationship("Document")
     user = relationship("User")
+
+
+class StudyTask(Base):
+    """Study planner tasks for organizing study sessions."""
+    __tablename__ = "study_tasks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, default="")
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
+    due_date = Column(DateTime, nullable=True)
+    priority = Column(String(10), default="medium")  # low, medium, high
+    status = Column(String(15), default="todo")  # todo, in_progress, done
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+    document = relationship("Document")
